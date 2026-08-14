@@ -21,6 +21,9 @@ import glob
 import json
 import os
 import re
+import selectors
+import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -494,7 +497,7 @@ def read_chatgpt_base_url_from_codex_config():
 
     try:
         for raw_line in config_path.read_text(errors='replace').splitlines():
-            line = raw_line.strip()
+            line = raw_line.split('#', 1)[0].strip()
 
             if not line or line.startswith('#'):
                 continue
@@ -529,6 +532,12 @@ def resolve_codex_usage_url():
     default_base = 'https://chatgpt.com/backend-api'
     base = read_chatgpt_base_url_from_codex_config() or default_base
     base = base.rstrip('/')
+
+    if (
+        base.startswith('https://chatgpt.com')
+        or base.startswith('https://chat.openai.com')
+    ) and '/backend-api' not in base:
+        base += '/backend-api'
 
     if '/backend-api' in base:
         return base + '/wham/usage'
@@ -899,6 +908,427 @@ def fetch_codex_usage(access_token, account_id=None):
         raise
 
 
+def map_codex_window(window, rpc=False):
+    """Normalize OAuth and app-server Codex rate-limit windows."""
+    if not isinstance(window, dict):
+        return None
+    used = window.get('usedPercent') if rpc else window.get('used_percent')
+    reset = window.get('resetsAt') if rpc else window.get('reset_at')
+    seconds = None
+    if rpc:
+        minutes = flexible_number(window.get('windowDurationMins'))
+        seconds = int(minutes * 60) if minutes is not None else None
+    else:
+        seconds = window.get('limit_window_seconds')
+    used = flexible_number(used)
+    if used is None:
+        return None
+    return {
+        'used_pct': clamp_percentage(used),
+        'reset_time': unix_to_iso(reset),
+        'window_seconds': seconds,
+    }
+
+
+def normalize_codex_windows(primary, secondary):
+    """Place Codex session and weekly windows by duration, not API position."""
+    def role(window):
+        seconds = (window or {}).get('window_seconds')
+        if seconds == 5 * 3600:
+            return 'session'
+        if seconds == 7 * 86400:
+            return 'weekly'
+        return 'unknown'
+
+    primary_role = role(primary)
+    secondary_role = role(secondary)
+    if primary and secondary:
+        if primary_role == 'weekly' and secondary_role in ('session', 'unknown'):
+            return secondary, primary
+        return primary, secondary
+    if primary:
+        return (None, primary) if primary_role == 'weekly' else (primary, None)
+    if secondary:
+        return (secondary, None) if secondary_role in ('session', 'unknown') else (None, secondary)
+    return None, None
+
+
+def codex_extra_rate_windows(usage):
+    """Lossily map model-specific Codex limits without affecting core windows."""
+    raw_limits = usage.get('additional_rate_limits')
+    if not isinstance(raw_limits, list):
+        return []
+    windows = []
+    used_ids = set()
+    for entry in raw_limits:
+        if not isinstance(entry, dict):
+            continue
+        limit_name = str(entry.get('limit_name') or '').strip()
+        metered_feature = str(entry.get('metered_feature') or '').strip()
+        name = limit_name or metered_feature
+        rate_limit = entry.get('rate_limit')
+        if not name or not isinstance(rate_limit, dict):
+            continue
+        candidates = [
+            ('primary', rate_limit.get('primary_window')),
+            ('secondary', rate_limit.get('secondary_window')),
+        ]
+        is_spark = any('spark' in value.lower() for value in (limit_name, metered_feature))
+        if not is_spark:
+            candidates = [next((item for item in candidates if isinstance(item[1], dict)), (None, None))]
+        for kind, raw_window in candidates:
+            window = map_codex_window(raw_window)
+            if not window:
+                continue
+            slug = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+            window_id = f'codex-{slug}'
+            title = name
+            if is_spark:
+                seconds = window.get('window_seconds') or 0
+                weekly = seconds >= 6 * 86400 or kind == 'secondary'
+                window_id = 'codex-spark-weekly' if weekly else 'codex-spark'
+                title = 'Codex Spark Weekly' if weekly else 'Codex Spark 5-hour'
+            if not window_id or window_id in used_ids:
+                continue
+            used_ids.add(window_id)
+            windows.append({'id': window_id, 'title': title, **window})
+    return windows
+
+
+def codex_spend_control_window(usage):
+    """Map Business/Team monthly individual credit limits when present."""
+    rate_limit = usage.get('rate_limit') or {}
+    spend_control = usage.get('spend_control') or usage.get('spendControl') or {}
+    if not isinstance(rate_limit, dict):
+        rate_limit = {}
+    if not isinstance(spend_control, dict):
+        spend_control = {}
+    candidates = [
+        usage.get('individual_limit') or usage.get('individualLimit'),
+        rate_limit.get('individual_limit') or rate_limit.get('individualLimit'),
+        spend_control.get('individual_limit') or spend_control.get('individualLimit'),
+    ]
+    details = next((value for value in candidates if isinstance(value, dict)), None)
+    if not details:
+        return None
+    remaining_pct = flexible_number(
+        details.get('remaining_percent', details.get('remainingPercent'))
+    )
+    used = flexible_number(details.get('used'))
+    limit = flexible_number(details.get('limit'))
+    if remaining_pct is not None:
+        used_pct = 100 - remaining_pct
+    elif used is not None and limit:
+        used_pct = used / limit * 100
+    else:
+        return None
+    reset = details.get('resets_at', details.get('resetsAt', details.get('reset_at')))
+    return {
+        'id': 'codex-monthly-credits',
+        'title': 'Monthly credits',
+        'used_pct': clamp_percentage(used_pct),
+        'reset_time': unix_to_iso(reset),
+        'window_seconds': None,
+        'used': used,
+        'limit': limit,
+    }
+
+
+def fetch_codex_reset_credits(access_token, account_id=None):
+    """Read available reset credits without redeeming or modifying them."""
+    usage_url = resolve_codex_usage_url()
+    if '/wham/usage' in usage_url:
+        url = usage_url.rsplit('/wham/usage', 1)[0] + '/wham/rate-limit-reset-credits'
+    else:
+        return None
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Accept': 'application/json',
+        'User-Agent': 'AIUsageMonitor',
+        'OpenAI-Beta': 'codex-1',
+        'originator': 'Codex Desktop',
+    }
+    if account_id:
+        headers['ChatGPT-Account-ID'] = account_id
+    payload = fetch_json_request(url, headers=headers, timeout=4)
+    available_count = payload.get('available_count')
+    if not isinstance(available_count, int) or available_count < 0:
+        return None
+    now = datetime.now(timezone.utc)
+    expiries = []
+    for credit in payload.get('credits') or []:
+        if not isinstance(credit, dict) or credit.get('status') != 'available':
+            continue
+        expires = parse_iso8601(credit.get('expires_at'))
+        if expires and expires > now:
+            expiries.append(expires)
+    return {
+        'available_count': available_count,
+        'next_expiry': min(expiries).isoformat() if expiries else None,
+    }
+
+
+def fetch_codex_monthly_spend_control(access_token, account_id):
+    """Best-effort Business/Team monthly spend-control usage."""
+    usage_url = resolve_codex_usage_url()
+    if '/wham/usage' not in usage_url or not account_id:
+        return None
+    base = usage_url.rsplit('/wham/usage', 1)[0]
+    encoded_account = urllib.parse.quote(str(account_id), safe='')
+    url = (
+        f'{base}/accounts/{encoded_account}'
+        '/spend-controls/current-user/monthly-usage'
+    )
+    payload = fetch_json_request(
+        url,
+        headers={
+            'Authorization': f'Bearer {access_token}',
+            'ChatGPT-Account-Id': str(account_id),
+            'Accept': 'application/json',
+            'User-Agent': 'AIUsageMonitor',
+        },
+        timeout=4,
+    )
+    effective = payload.get('effective_monthly_limit') or {}
+    if not isinstance(effective, dict):
+        return None
+    enforcement = str(effective.get('enforcement_mode') or '').lower()
+    if enforcement in ('none', 'off', 'disabled', 'no_limit'):
+        return None
+    limit = flexible_number(effective.get('limit'))
+    used = flexible_number(payload.get('current_month_usage')) or 0
+    if not limit or limit <= 0:
+        return None
+    return {
+        'id': 'codex-monthly-credits',
+        'title': 'Monthly credits',
+        'used_pct': clamp_percentage(max(0, used) / limit * 100),
+        'reset_time': None,
+        'window_seconds': None,
+        'used': max(0, used),
+        'limit': limit,
+    }
+
+
+def resolve_codex_executable():
+    """Find Codex CLI in PATH and common Linux user-install locations."""
+    resolved = shutil.which('codex')
+    if resolved:
+        return resolved
+    home = Path.home()
+    candidates = [
+        home / '.local' / 'bin' / 'codex',
+        home / '.npm-global' / 'bin' / 'codex',
+        home / '.bun' / 'bin' / 'codex',
+    ]
+    candidates.extend(sorted((home / '.nvm' / 'versions' / 'node').glob('*/bin/codex'), reverse=True))
+    return next((str(path) for path in candidates if path.is_file() and os.access(path, os.X_OK)), None)
+
+
+def stop_rpc_process(process):
+    """Bounded TERM-to-KILL teardown for a Codex app-server process group."""
+    if process.poll() is not None:
+        return
+    try:
+        process.stdin.close()
+    except Exception:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=0.5)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def rpc_read_message(process, selector, request_id, timeout):
+    """Read one matching newline-delimited JSON-RPC response."""
+    deadline = time.monotonic() + timeout
+    buffer = b''
+    while time.monotonic() < deadline:
+        events = selector.select(max(0, deadline - time.monotonic()))
+        if not events:
+            break
+        chunk = os.read(process.stdout.fileno(), 65536)
+        if not chunk:
+            break
+        buffer += chunk
+        if len(buffer) > 1024 * 1024:
+            raise RuntimeError('Codex RPC response exceeded 1 MiB')
+        while b'\n' in buffer:
+            raw_line, buffer = buffer.split(b'\n', 1)
+            try:
+                message = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if message.get('id') != request_id:
+                continue
+            if isinstance(message.get('error'), dict):
+                text = sanitize_error_text(message['error'].get('message') or 'Codex RPC request failed')
+                raise RuntimeError(text)
+            result_data = message.get('result')
+            if isinstance(result_data, dict):
+                return result_data
+            raise RuntimeError('Codex RPC returned an invalid result')
+    raise TimeoutError('Codex app-server request timed out')
+
+
+def rpc_send(process, payload):
+    process.stdin.write(json.dumps(payload, separators=(',', ':')) + '\n')
+    process.stdin.flush()
+
+
+def fetch_codex_rpc_provider():
+    """Read Codex limits through the CLI's sandboxed app-server RPC."""
+    executable = resolve_codex_executable()
+    if not executable:
+        return None
+    process = subprocess.Popen(
+        [executable, '-s', 'read-only', '-a', 'untrusted', 'app-server'],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
+    )
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        rpc_send(process, {
+            'id': 1,
+            'method': 'initialize',
+            'params': {'clientInfo': {'name': 'ai-usage-monitor', 'version': '1.0'}},
+        })
+        rpc_read_message(process, selector, 1, 8)
+        rpc_send(process, {'method': 'initialized', 'params': {}})
+        rpc_send(process, {'id': 2, 'method': 'account/rateLimits/read', 'params': {}})
+        limits_result = rpc_read_message(process, selector, 2, 4)
+        rpc_send(process, {'id': 3, 'method': 'account/read', 'params': {}})
+        try:
+            account_result = rpc_read_message(process, selector, 3, 4)
+        except Exception:
+            account_result = {}
+    finally:
+        selector.close()
+        stop_rpc_process(process)
+
+    limits = limits_result.get('rateLimits') or {}
+    primary = map_codex_window(limits.get('primary'), rpc=True)
+    secondary = map_codex_window(limits.get('secondary'), rpc=True)
+    primary, secondary = normalize_codex_windows(primary, secondary)
+    account = account_result.get('account') or {}
+    if not isinstance(account, dict):
+        account = {}
+    email = account.get('email') if isinstance(account, dict) else ''
+    result_data = {
+        'installed': True,
+        'authenticated': True,
+        'has_data': bool(primary or secondary),
+        'source': 'cli_rpc',
+        'credential_source': 'codex_cli',
+        'five_hour_pct': primary.get('used_pct') if primary else None,
+        'five_hour_reset': primary.get('reset_time') if primary else None,
+        'five_hour_window_seconds': primary.get('window_seconds') if primary else None,
+        'seven_day_pct': secondary.get('used_pct') if secondary else None,
+        'seven_day_reset': secondary.get('reset_time') if secondary else None,
+        'seven_day_window_seconds': secondary.get('window_seconds') if secondary else None,
+        'plan_type': limits.get('planType') or limits.get('plan_type') or account.get('planType') or '',
+        'account_label': email or '',
+        'extra_rate_windows': [],
+    }
+    credits = limits.get('credits') or {}
+    if isinstance(credits, dict):
+        result_data['credits_balance'] = credits.get('balance')
+        result_data['credits_unlimited'] = credits.get('unlimited') is True
+    rate_limits_by_id = (
+        limits_result.get('rateLimitsByLimitId')
+        or limits_result.get('rate_limits_by_limit_id')
+        or {}
+    )
+    candidates = [limits]
+    if isinstance(rate_limits_by_id, dict):
+        candidates.extend(value for value in rate_limits_by_id.values() if isinstance(value, dict))
+    for candidate in candidates:
+        individual = candidate.get('individualLimit') or candidate.get('individual_limit')
+        monthly = codex_spend_control_window({'individual_limit': individual})
+        if monthly:
+            result_data['extra_rate_windows'].append(monthly)
+            break
+    has_credits = result_data.get('credits_unlimited') is True or result_data.get('credits_balance') is not None
+    result_data['has_data'] = bool(primary or secondary or result_data['extra_rate_windows'] or has_credits)
+    if not result_data['has_data']:
+        return None
+    return result_data
+
+
+def map_codex_api_result(usage, credentials):
+    """Map the OAuth usage payload and best-effort additive Codex data."""
+    rate_limit = usage.get('rate_limit') or {}
+    if not isinstance(rate_limit, dict):
+        rate_limit = {}
+    primary = map_codex_window(rate_limit.get('primary_window'))
+    secondary = map_codex_window(rate_limit.get('secondary_window'))
+    primary, secondary = normalize_codex_windows(primary, secondary)
+    extra_windows = codex_extra_rate_windows(usage)
+    spend_control = codex_spend_control_window(usage)
+    account_id = credentials.get('account_id') or usage.get('account_id')
+    plan = str(usage.get('plan_type') or '').lower()
+    if (
+        not spend_control
+        and ('spend_control' in usage or 'spendControl' in usage)
+        and plan in ('team', 'business', 'education', 'quorum', 'k12', 'enterprise', 'edu', 'free_workspace')
+        and account_id
+    ):
+        try:
+            spend_control = fetch_codex_monthly_spend_control(
+                credentials['access_token'], account_id
+            )
+        except Exception:
+            spend_control = None
+    if spend_control:
+        extra_windows.append(spend_control)
+    result_data = {
+        'installed': True,
+        'authenticated': True,
+        'has_data': bool(primary or secondary),
+        'source': 'api_usage',
+        'five_hour_pct': primary.get('used_pct') if primary else None,
+        'seven_day_pct': secondary.get('used_pct') if secondary else None,
+        'five_hour_reset': primary.get('reset_time') if primary else None,
+        'seven_day_reset': secondary.get('reset_time') if secondary else None,
+        'five_hour_window_seconds': primary.get('window_seconds') if primary else None,
+        'seven_day_window_seconds': secondary.get('window_seconds') if secondary else None,
+        'plan_type': usage.get('plan_type') or '',
+        'account_id': account_id or '',
+        'credential_source': credentials.get('source') or '',
+        'extra_rate_windows': extra_windows,
+    }
+    credits = usage.get('credits') or {}
+    if isinstance(credits, dict):
+        result_data['credits_balance'] = flexible_number(credits.get('balance'))
+        result_data['credits_unlimited'] = credits.get('unlimited') is True
+    has_credits = result_data.get('credits_unlimited') is True or result_data.get('credits_balance') is not None
+    result_data['has_data'] = bool(primary or secondary or extra_windows or has_credits)
+    try:
+        reset_credits = fetch_codex_reset_credits(
+            credentials['access_token'],
+            credentials.get('account_id') or usage.get('account_id'),
+        )
+        if reset_credits:
+            result_data['reset_credits_available'] = reset_credits['available_count']
+            result_data['reset_credits_next_expiry'] = reset_credits['next_expiry']
+    except Exception:
+        pass
+    return result_data
+
+
 def should_try_next_codex_credential(error_info):
     """Decide whether the next credential candidate should be tried."""
     fail_reason = error_info.get('fail_reason')
@@ -1034,6 +1464,12 @@ def fetch_codex_provider():
     credentials_list = load_codex_credentials()
 
     if not credentials_list:
+        try:
+            rpc_result = fetch_codex_rpc_provider()
+            if rpc_result:
+                return rpc_result
+        except Exception:
+            pass
         local = read_codex_local_jsonl_fallback()
 
         if local.get('installed') and local.get('has_data'):
@@ -1061,25 +1497,7 @@ def fetch_codex_provider():
                 account_id=credentials.get('account_id'),
             )
 
-            rate_limit = usage.get('rate_limit') or {}
-            primary = rate_limit.get('primary_window') or {}
-            secondary = rate_limit.get('secondary_window') or {}
-
-            return {
-                'installed': True,
-                'authenticated': True,
-                'has_data': True,
-                'source': 'api_usage',
-                'five_hour_pct': primary.get('used_percent', 0),
-                'seven_day_pct': secondary.get('used_percent', 0) if secondary else None,
-                'five_hour_reset': unix_to_iso(primary.get('reset_at')),
-                'seven_day_reset': unix_to_iso(secondary.get('reset_at')) if secondary else None,
-                'five_hour_window_seconds': primary.get('limit_window_seconds'),
-                'seven_day_window_seconds': secondary.get('limit_window_seconds') if secondary else None,
-                'plan_type': usage.get('plan_type') or '',
-                'account_id': credentials.get('account_id') or '',
-                'credential_source': credentials.get('source') or '',
-            }
+            return map_codex_api_result(usage, credentials)
 
         except urllib.error.HTTPError as e:
             body = read_http_error_body(e)
@@ -1104,6 +1522,15 @@ def fetch_codex_provider():
                 continue
 
             break
+
+    if last_error and should_try_next_codex_credential(last_error):
+        try:
+            rpc_result = fetch_codex_rpc_provider()
+            if rpc_result:
+                rpc_result['warning'] = 'Codex OAuth failed, using CLI RPC'
+                return rpc_result
+        except Exception:
+            pass
 
     local = read_codex_local_jsonl_fallback()
 

@@ -5,7 +5,7 @@
 Cross-platform desktop widget/extension to monitor usage for:
 
 - **Claude Code** - Track your 5-hour and 7-day usage limits
-- **OpenAI Codex** - Monitor your Codex API quotas
+- **OpenAI Codex** - Monitor OAuth or CLI quotas, model-specific limits, credits, and reset inventory
 - **Gemini CLI** - Keep track of Gemini model usage across all available models
 - **Z.AI** - Monitor token and request quotas
 - **Kimi Code** - Track short and weekly Coding Plan windows
@@ -54,6 +54,7 @@ cd gnome-extension/aiusagemonitor@aimonitor
 - **Privacy-first** - No sensitive data exposed, all credentials stay local
 - **Detailed metrics** - See usage percentages, reset times, and model information
 - **Read-only provider checks** - Cursor and QwenCloud checks never issue model requests
+- **Codex fallback** - Uses sandboxed `codex app-server` RPC when OAuth is unavailable or rejected
 
 Additional providers discover credentials from existing application state or environment variables:
 

@@ -57,6 +57,7 @@ Item {
         if (data.has_usage === false || data.usage_supported === false) return false
         var hasPercentage = (data.used_pct !== undefined && data.used_pct !== null)
             || (data.five_hour_pct !== undefined && data.five_hour_pct !== null)
+            || (data.seven_day_pct !== undefined && data.seven_day_pct !== null)
         if (!hasPercentage) return false
         return true
     }
@@ -85,7 +86,10 @@ Item {
     property real activePct: {
         if (!hasUsableUsage(activeData)) return 0
         if (panelTool === "gemini") return Math.min((gd.used_pct || 0), 100)
-        return Math.min((activeData.five_hour_pct || 0), 100)
+        var pct = activeData.five_hour_pct
+        if (pct === undefined || pct === null)
+            pct = activeData.seven_day_pct
+        return Math.min((pct || 0), 100)
     }
 
     property string activeText: {
@@ -105,7 +109,10 @@ Item {
             return gd.used_pct !== undefined ? Math.round(gd.used_pct) + "%" : "—"
         }
 
-        return activeData.five_hour_pct !== undefined ? Math.round(activeData.five_hour_pct) + "%" : "—"
+        var pct = activeData.five_hour_pct
+        if (pct === undefined || pct === null)
+            pct = activeData.seven_day_pct
+        return pct !== undefined && pct !== null ? Math.round(pct) + "%" : "—"
     }
 
     property string iconSource: {

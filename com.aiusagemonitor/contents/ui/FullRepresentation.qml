@@ -114,6 +114,7 @@ Item {
         if (source === "codex_api_key") return "API key"
         if (source === "opencode_oauth") return "OpenCode OAuth"
         if (source === "api_usage") return "API usage"
+        if (source === "cli_rpc" || source === "codex_cli") return "CLI RPC"
         if (source === "local_jsonl_fallback") return "local fallback"
         return source
     }
@@ -397,7 +398,8 @@ Item {
 
                 Loader {
                     Layout.fillWidth: true
-                    active: od.five_hour_pct !== undefined && od.has_data !== false && !od.error
+                    active: od.five_hour_pct !== undefined && od.five_hour_pct !== null
+                        && od.has_data !== false && !od.error
 
                     sourceComponent: UsageBar {
                         label: "5h"
@@ -410,7 +412,8 @@ Item {
 
                 Loader {
                     Layout.fillWidth: true
-                    active: od.seven_day_pct !== undefined && od.has_data !== false && !od.error
+                    active: od.seven_day_pct !== undefined && od.seven_day_pct !== null
+                        && od.has_data !== false && !od.error
 
                     sourceComponent: UsageBar {
                         label: "7d"
@@ -419,6 +422,37 @@ Item {
                         resetText: fullRoot.formatReset(od.seven_day_reset)
                         barColor: fullRoot.usageColor(od.seven_day_pct || 0)
                     }
+                }
+
+                Repeater {
+                    model: od.extra_rate_windows || []
+
+                    delegate: UsageBar {
+                        required property var modelData
+                        label: modelData.title || "Codex extra limit"
+                        pct: Math.min(modelData.used_pct || 0, 100)
+                        pctText: Math.round(modelData.used_pct || 0) + "%"
+                        resetText: fullRoot.formatReset(modelData.reset_time)
+                        barColor: fullRoot.usageColor(modelData.used_pct || 0)
+                    }
+                }
+
+                InfoBox {
+                    visible: od.reset_credits_available > 0
+                    title: "Rate-limit resets"
+                    text: od.reset_credits_available + " available"
+                        + (od.reset_credits_next_expiry
+                            ? " · next expires " + fullRoot.formatReset(od.reset_credits_next_expiry)
+                            : "")
+                    tone: "info"
+                }
+
+                InfoBox {
+                    visible: od.credits_unlimited === true
+                        || (od.credits_balance !== undefined && od.credits_balance !== null)
+                    title: "Credits"
+                    text: od.credits_unlimited === true ? "Unlimited" : od.credits_balance
+                    tone: "info"
                 }
 
                 PC3.Label {

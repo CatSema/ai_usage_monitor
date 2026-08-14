@@ -220,13 +220,13 @@ class AIUsageIndicator extends PanelMenu.Button {
     _getToolPct(tool, data) {
         if (tool === 'gemini')
             return Number(data.used_pct ?? 0);
-        return Number(data.five_hour_pct ?? 0);
+        return Number(data.five_hour_pct ?? data.seven_day_pct ?? 0);
     }
 
     _getToolReset(tool, data) {
         if (tool === 'gemini')
             return data.reset_time;
-        return data.five_hour_reset;
+        return data.five_hour_reset ?? data.seven_day_reset;
     }
 
     _getToolName(tool) {
@@ -380,12 +380,33 @@ class AIUsageIndicator extends PanelMenu.Button {
                 section.add_child(this._createUsageBar(data.model || 'Gemini quota', data.used_pct, data.reset_time));
             }
         } else {
-            if (data.five_hour_pct !== undefined && !data.error)
+            if (data.five_hour_pct !== undefined && data.five_hour_pct !== null && !data.error)
                 section.add_child(this._createUsageBar(
                     data.primary_label || '5h', data.five_hour_pct, data.five_hour_reset));
             if (data.seven_day_pct !== undefined && data.seven_day_pct !== null && !data.error)
                 section.add_child(this._createUsageBar(
                     data.secondary_label || '7d', data.seven_day_pct, data.seven_day_reset));
+            for (const window of data.extra_rate_windows || []) {
+                if (window.used_pct !== undefined)
+                    section.add_child(this._createUsageBar(
+                        window.title || 'Extra limit', window.used_pct, window.reset_time));
+            }
+            if (data.reset_credits_available > 0) {
+                section.add_child(new St.Label({
+                    text: `${data.reset_credits_available} rate-limit reset${data.reset_credits_available === 1 ? '' : 's'} available` +
+                        (data.reset_credits_next_expiry
+                            ? ` · next expires ${this._formatReset(data.reset_credits_next_expiry)}`
+                            : ''),
+                    style: 'color: #3b82f6; font-size: 10px; margin-bottom: 4px;',
+                }));
+            }
+            if (data.credits_unlimited === true ||
+                (data.credits_balance !== undefined && data.credits_balance !== null)) {
+                section.add_child(new St.Label({
+                    text: `Credits: ${data.credits_unlimited === true ? 'Unlimited' : data.credits_balance}`,
+                    style: 'color: #3b82f6; font-size: 10px; margin-bottom: 4px;',
+                }));
+            }
             if (!data.error && data.authenticated === true && data.has_usage === false) {
                 const note = new St.Label({
                     text: data.usage_note || 'Quota percentage is not exposed by this provider.',
