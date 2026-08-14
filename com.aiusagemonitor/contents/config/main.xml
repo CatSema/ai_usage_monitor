@@ -23,6 +23,12 @@
             <min>60</min>
             <max>3600</max>
         </entry>
+        <entry name="additionalRefreshSecs" type="Int">
+            <label>Additional providers refresh interval (seconds)</label>
+            <default>300</default>
+            <min>60</min>
+            <max>3600</max>
+        </entry>
         <entry name="panelTool" type="String">
             <label>Tool to display in panel</label>
             <default>claude</default>
@@ -38,6 +44,21 @@
             <default>true</default>
         </entry>
         <entry name="showGemini" type="Bool">
+            <default>true</default>
+        </entry>
+        <entry name="showZai" type="Bool">
+            <default>true</default>
+        </entry>
+        <entry name="showKimi" type="Bool">
+            <default>true</default>
+        </entry>
+        <entry name="showMinimax" type="Bool">
+            <default>true</default>
+        </entry>
+        <entry name="showQwen" type="Bool">
+            <default>true</default>
+        </entry>
+        <entry name="showCursor" type="Bool">
             <default>true</default>
         </entry>
     </group>

@@ -17,6 +17,8 @@ Item {
     function providerData(provider) {
         if (provider === "codex") return od
         if (provider === "gemini") return gd
+        if (root.additionalData && root.additionalData[provider])
+            return root.additionalData[provider]
         return cd
     }
 
@@ -38,6 +40,11 @@ Item {
         if (providerIsAvailable("claude"))
             return "claude"
 
+        for (var provider of root.additionalProviders) {
+            if (providerIsAvailable(provider))
+                return provider
+        }
+
         return configuredPanelTool || "codex"
     }
 
@@ -48,12 +55,20 @@ Item {
         if (!data || data.installed !== true) return false
         if (data.error) return false
         if (data.has_usage === false || data.usage_supported === false) return false
-        if (data.used_pct === undefined || data.used_pct === null) return false
+        var hasPercentage = (data.used_pct !== undefined && data.used_pct !== null)
+            || (data.five_hour_pct !== undefined && data.five_hour_pct !== null)
+        if (!hasPercentage) return false
         return true
     }
 
-    function geminiModeText() {
-        var mode = (gd.auth_type || "").toLowerCase()
+    function providerModeText(provider, data) {
+        if (provider === "zai") return "Z.AI"
+        if (provider === "kimi") return "Kimi"
+        if (provider === "minimax") return "MM"
+        if (provider === "qwen") return "Qwen"
+        if (provider === "cursor") return "Cursor"
+
+        var mode = (data.auth_type || "").toLowerCase()
 
         if (mode === "api-key")
             return "API"
@@ -68,18 +83,13 @@ Item {
     }
 
     property real activePct: {
-        if (panelTool === "gemini") {
-            if (!hasUsableUsage(gd))
-                return 0
-
-            return Math.min((gd.used_pct || 0), 100)
-        }
-
+        if (!hasUsableUsage(activeData)) return 0
+        if (panelTool === "gemini") return Math.min((gd.used_pct || 0), 100)
         return Math.min((activeData.five_hour_pct || 0), 100)
     }
 
     property string activeText: {
-        if (root.isLoading)
+        if (root.isLoading && (!activeData || activeData.installed !== true))
             return "…"
 
         if (!activeData || activeData.installed !== true)
@@ -88,10 +98,10 @@ Item {
         if (activeData.error)
             return "!"
 
-        if (panelTool === "gemini") {
-            if (!hasUsableUsage(gd))
-                return gd.authenticated === true ? geminiModeText() : "!"
+        if (!hasUsableUsage(activeData))
+            return activeData.authenticated === true ? providerModeText(panelTool, activeData) : "!"
 
+        if (panelTool === "gemini") {
             return gd.used_pct !== undefined ? Math.round(gd.used_pct) + "%" : "—"
         }
 
@@ -104,6 +114,9 @@ Item {
 
         if (panelTool === "gemini")
             return Qt.resolvedUrl("../images/gemini_icon.png")
+
+        if (panelTool !== "claude")
+            return ""
 
         return Qt.resolvedUrl("../images/claude-icon-22.png")
     }
@@ -122,15 +135,11 @@ Item {
         if (activeData.error)
             return "#ef4444"
 
-        if (panelTool === "gemini") {
-            if (gd.authenticated !== true)
-                return "#ef4444"
+        if (activeData.authenticated === false)
+            return "#ef4444"
 
-            if (!hasUsableUsage(gd))
-                return Kirigami.Theme.highlightColor
-
-            return usageColor(activePct)
-        }
+        if (!hasUsableUsage(activeData))
+            return Kirigami.Theme.highlightColor
 
         return usageColor(activePct)
     }
@@ -151,7 +160,7 @@ Item {
             Layout.preferredHeight: 16
             fillMode: Image.PreserveAspectFit
             smooth: true
-            visible: activeData && activeData.installed === true
+            visible: source.toString() !== "" && activeData && activeData.installed === true
         }
 
         Item {
@@ -165,9 +174,8 @@ Item {
 
                 property real pct: compactRoot.activePct
                 property color color: Qt.color(compactRoot.ringColor())
-                property bool noUsage: panelTool === "gemini"
-                    && !compactRoot.hasUsableUsage(gd)
-                    && gd.authenticated === true
+                property bool noUsage: !compactRoot.hasUsableUsage(activeData)
+                    && activeData.authenticated === true
 
                 onPctChanged: requestPaint()
                 onColorChanged: requestPaint()

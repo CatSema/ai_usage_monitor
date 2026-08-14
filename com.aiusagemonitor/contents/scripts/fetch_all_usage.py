@@ -22,9 +22,11 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -108,6 +110,16 @@ def sanitize_error_text(text):
         '<redacted>',
         value,
     )
+
+    for name in (
+        'ZAI_API_KEY', 'ZAI_KEY', 'ZHIPU_API_KEY', 'ZHIPUAI_API_KEY',
+        'KIMI_API_KEY', 'KIMI_CODE_API_KEY', 'KIMI_KEY',
+        'MINIMAX_KEY', 'MINIMAX_API_KEY', 'QWEN_API_KEY',
+        'BAILIAN_TOKEN_PLAN_API_KEY', 'CURSOR_SESSION_TOKEN',
+    ):
+        secret = provider_environment().get(name, '')
+        if len(secret) >= 8:
+            value = value.replace(secret, '<redacted>')
 
     value = re.sub(
         r'eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+',
@@ -2677,63 +2689,626 @@ def fetch_gemini_provider():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Additional providers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def provider_environment():
+    """Load provider variables from the process and safe declarative files."""
+    environment = dict(os.environ)
+    paths = [Path.home() / '.config' / 'ai-usage-monitor' / '.env']
+    environment_dir = Path.home() / '.config' / 'environment.d'
+    if environment_dir.exists():
+        paths.extend(sorted(environment_dir.glob('*.conf')))
+    for path in paths:
+        for key, value in parse_simple_dotenv(path).items():
+            if not environment.get(key, '').strip():
+                environment[key] = value
+    return environment
+
+
+def first_env(*names):
+    """Return the first non-empty environment value."""
+    environment = provider_environment()
+    for name in names:
+        value = environment.get(name, '').strip()
+        if value:
+            return value
+    return ''
+
+
+def clamp_percentage(value):
+    """Convert a numeric value to a percentage in the 0..100 range."""
+    return max(0, min(100, round(float(value), 2)))
+
+
+def flexible_number(value):
+    """Parse API numbers that may be encoded as strings."""
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def reset_from_value(value, now=None):
+    """Normalize ISO, Unix seconds, and Unix milliseconds reset values."""
+    now = now or datetime.now(timezone.utc)
+    numeric = flexible_number(value)
+    if numeric is not None:
+        if numeric > 10_000_000_000:
+            numeric /= 1000
+        return datetime.fromtimestamp(numeric, tz=timezone.utc).isoformat()
+    parsed = parse_iso8601(value)
+    return parsed.isoformat() if parsed else None
+
+
+def make_window(used_pct, reset_time=None, window_seconds=None, label=''):
+    """Build the common usage-window JSON shape."""
+    return {
+        'used_pct': clamp_percentage(used_pct),
+        'reset_time': reset_time,
+        'window_seconds': window_seconds,
+        'label': label,
+    }
+
+
+def windows_result(primary=None, secondary=None, **extra):
+    """Expose generic windows and compatibility fields used by current UIs."""
+    result_data = {
+        'installed': True,
+        'authenticated': True,
+        'has_data': bool(primary or secondary),
+        'has_usage': bool(primary or secondary),
+        'usage_supported': bool(primary or secondary),
+        'primary': primary,
+        'secondary': secondary,
+    }
+    if primary:
+        result_data.update({
+            'five_hour_pct': primary['used_pct'],
+            'five_hour_reset': primary.get('reset_time'),
+            'primary_label': primary.get('label') or 'Usage',
+        })
+    if secondary:
+        result_data.update({
+            'seven_day_pct': secondary['used_pct'],
+            'seven_day_reset': secondary.get('reset_time'),
+            'secondary_label': secondary.get('label') or 'Secondary',
+        })
+    result_data.update(extra)
+    return result_data
+
+
+def fetch_json_request(url, headers=None, data=None, method=None, timeout=10):
+    """Perform a JSON request and attach retry metadata to HTTP failures."""
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers=headers or {},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        error.retry_after_info = parse_retry_after(error.headers.get('Retry-After'))
+        raise
+
+
+def fetch_zai_provider():
+    """Fetch Z.AI token and time quota windows."""
+    api_key = first_env('ZAI_API_KEY', 'ZAI_KEY', 'ZHIPU_API_KEY', 'ZHIPUAI_API_KEY')
+    if not api_key:
+        return {'installed': False, 'authenticated': False}
+
+    payload = fetch_json_request(
+        'https://api.z.ai/api/monitor/usage/quota/limit',
+        headers={
+            'Authorization': api_key,
+            'Accept': 'application/json',
+            'User-Agent': 'AIUsageMonitor',
+        },
+    )
+    if payload.get('success') is not True:
+        raise RuntimeError('Invalid Z.AI quota response')
+
+    token_window = None
+    time_window = None
+    for item in (payload.get('data') or {}).get('limits') or []:
+        percentage = flexible_number(item.get('percentage'))
+        if percentage is None:
+            used = flexible_number(item.get('currentValue'))
+            total = flexible_number(item.get('usage'))
+            if used is None or not total:
+                continue
+            percentage = used / total * 100
+        window = make_window(
+            percentage,
+            reset_from_value(item.get('nextResetTime')),
+            label='Tokens' if item.get('type') == 'TOKENS_LIMIT' else 'Requests',
+        )
+        if item.get('type') == 'TOKENS_LIMIT':
+            token_window = window
+        elif item.get('type') == 'TIME_LIMIT':
+            time_window = window
+
+    return windows_result(
+        token_window or time_window,
+        time_window if token_window else None,
+        credential_source='environment',
+    )
+
+
+def kimi_window(detail, window_seconds=None, now=None, label='Usage'):
+    """Convert one Kimi limit object to a common usage window."""
+    if not isinstance(detail, dict):
+        return None
+    now = now or datetime.now(timezone.utc)
+    limit = flexible_number(detail.get('limit'))
+    used = flexible_number(detail.get('used'))
+    remaining = flexible_number(detail.get('remaining'))
+    if not limit or (used is None and remaining is None):
+        return None
+    if used is None:
+        used = limit - remaining
+    reset_time = reset_from_value(detail.get('resetAt') or detail.get('resetTime'), now)
+    reset_in = flexible_number(detail.get('resetIn') or detail.get('reset_in'))
+    if not reset_time and reset_in and reset_in > 0:
+        reset_time = (now + timedelta(seconds=reset_in)).isoformat()
+    return make_window(used / limit * 100, reset_time, window_seconds, label)
+
+
+def duration_seconds(duration, unit):
+    """Convert provider duration/unit pairs to seconds."""
+    duration = flexible_number(duration)
+    if not duration or duration <= 0:
+        return None
+    unit = str(unit or '').upper()
+    multiplier = 1
+    if 'MINUTE' in unit:
+        multiplier = 60
+    elif 'HOUR' in unit:
+        multiplier = 3600
+    elif 'DAY' in unit:
+        multiplier = 86400
+    elif 'WEEK' in unit:
+        multiplier = 604800
+    return int(duration * multiplier)
+
+
+def fetch_kimi_provider():
+    """Fetch Kimi Code short and weekly request windows."""
+    api_key = first_env('KIMI_API_KEY', 'KIMI_CODE_API_KEY', 'KIMI_KEY')
+    if not api_key and 'api.kimi.com/coding' in provider_environment().get('ANTHROPIC_BASE_URL', '').lower():
+        api_key = first_env('ANTHROPIC_API_KEY')
+    if not api_key:
+        return {'installed': False, 'authenticated': False}
+
+    payload = fetch_json_request(
+        'https://api.kimi.com/coding/v1/usages',
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Accept': 'application/json',
+            'User-Agent': 'AIUsageMonitor',
+        },
+    )
+    now = datetime.now(timezone.utc)
+    windows = []
+    for item in payload.get('limits') or []:
+        window_spec = item.get('window') or {}
+        seconds = duration_seconds(
+            window_spec.get('duration', item.get('duration')),
+            window_spec.get('timeUnit', item.get('timeUnit')),
+        )
+        detail = item.get('detail') or {}
+        label = (
+            detail.get('name') or detail.get('title') or item.get('name')
+            or item.get('title') or item.get('scope') or 'Limit'
+        )
+        window = kimi_window(detail, seconds, now, label)
+        if window:
+            windows.append(window)
+
+    weekly_summary = kimi_window(payload.get('usage'), 7 * 86400, now, 'Weekly')
+    weekly = next(
+        (
+            window for window in windows
+            if (window.get('window_seconds') or 0) >= 6 * 86400
+            or 'week' in window.get('label', '').lower()
+            or '7d' in window.get('label', '').lower()
+        ),
+        weekly_summary,
+    )
+    shorter = sorted(
+        (window for window in windows if window is not weekly),
+        key=lambda window: window.get('window_seconds') or sys.maxsize,
+    )
+    primary = shorter[0] if shorter else weekly
+    secondary = weekly if weekly and weekly is not primary else None
+    return windows_result(primary, secondary, credential_source='environment')
+
+
+def fetch_minimax_provider():
+    """Fetch MiniMax Coding Plan prompt quota."""
+    api_key = first_env('MINIMAX_KEY', 'MINIMAX_API_KEY')
+    if not api_key:
+        return {'installed': False, 'authenticated': False}
+
+    payload = fetch_json_request(
+        'https://api.minimax.io/v1/api/openplatform/coding_plan/remains',
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Accept': 'application/json, text/plain, */*',
+            'Referer': 'https://platform.minimax.com/user-center/payment/coding-plan',
+            'User-Agent': 'AIUsageMonitor',
+        },
+    )
+    base_response = payload.get('base_resp')
+    if not isinstance(base_response, dict) or base_response.get('status_code') != 0:
+        message = base_response.get('status_msg') if isinstance(base_response, dict) else ''
+        raise RuntimeError(message or 'MiniMax quota request failed')
+    models = payload.get('model_remains') or []
+    if not models:
+        raise RuntimeError('No active MiniMax Coding Plan')
+    item = models[0]
+    remaining = flexible_number(item.get('current_interval_usage_count')) or 0
+    total = flexible_number(item.get('current_interval_total_count')) or 0
+    if total <= 0:
+        raise RuntimeError('Invalid MiniMax quota response')
+    used = max(0, total - remaining)
+    primary = make_window(
+        used / total * 100,
+        reset_from_value(item.get('end_time')),
+        5 * 3600,
+        '5h prompts',
+    )
+    model = item.get('model_name') or ''
+    return windows_result(
+        primary,
+        account_label=f'{model}: {int(used)}/{int(total)} prompts'.strip(': '),
+        credential_source='environment',
+    )
+
+
+def qwen_api_key():
+    """Load a QwenCloud Individual Token Plan key."""
+    for name in ('QWEN_API_KEY', 'BAILIAN_TOKEN_PLAN_API_KEY'):
+        key = first_env(name)
+        if key.startswith('sk-sp-'):
+            return key
+    settings_path = Path.home() / '.qwen' / 'settings.json'
+    try:
+        settings = json.loads(settings_path.read_text(errors='replace'))
+        key = str((settings.get('env') or {}).get('BAILIAN_TOKEN_PLAN_API_KEY') or '').strip()
+        return key if key.startswith('sk-sp-') else ''
+    except Exception:
+        return ''
+
+
+def fetch_qwen_provider():
+    """Validate QwenCloud Individual auth without consuming inference credits."""
+    api_key = qwen_api_key()
+    installed = (Path.home() / '.qwen').exists() or bool(api_key)
+    if not api_key:
+        return {
+            'installed': installed,
+            'authenticated': False,
+            'has_usage': False,
+            'fail_reason': 'auth_required',
+            'error': 'QwenCloud Individual key not found',
+        }
+    fetch_json_request(
+        'https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/models',
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Accept': 'application/json',
+            'User-Agent': 'AIUsageMonitor',
+        },
+    )
+    return {
+        'installed': True,
+        'authenticated': True,
+        'has_data': False,
+        'has_usage': False,
+        'usage_supported': False,
+        'account_label': 'Individual Token Plan',
+        'usage_note': 'API key verified. QwenCloud does not expose subscription quota through API-key authentication.',
+    }
+
+
+def cursor_candidate_paths():
+    """Return Linux Cursor session database and auth-file candidates."""
+    home = Path.home()
+    databases = [
+        home / '.config' / app / 'User' / 'globalStorage' / 'state.vscdb'
+        for app in ('Cursor', 'Cursor Nightly')
+    ]
+    databases.extend([
+        home / '.var' / 'app' / 'com.cursor.Cursor' / 'config' / 'Cursor' / 'User' / 'globalStorage' / 'state.vscdb',
+    ])
+    auth_files = [
+        home / '.config' / 'cursor' / 'auth.json',
+        home / '.cursor' / 'auth.json',
+    ]
+    return databases, auth_files
+
+
+def normalize_cursor_token(value):
+    """Decode tokens stored as JSON strings in Cursor's SQLite state."""
+    value = str(value or '').strip()
+    if not value:
+        return ''
+    try:
+        decoded = json.loads(value)
+        return decoded.strip() if isinstance(decoded, str) else value
+    except Exception:
+        return value
+
+
+def cursor_tokens():
+    """Load Cursor session tokens without modifying Cursor state."""
+    override = first_env('CURSOR_SESSION_TOKEN')
+    if override:
+        return [override]
+    databases, auth_files = cursor_candidate_paths()
+    tokens = []
+    for path in databases:
+        if not path.exists():
+            continue
+        try:
+            uri = f'file:{urllib.parse.quote(str(path))}?mode=ro'
+            with sqlite3.connect(uri, uri=True) as database:
+                row = database.execute(
+                    'SELECT value FROM ItemTable WHERE key = ? LIMIT 1',
+                    ('cursorAuth/accessToken',),
+                ).fetchone()
+            if row:
+                token = normalize_cursor_token(row[0])
+                if token:
+                    tokens.append(token)
+        except sqlite3.Error:
+            continue
+    for path in auth_files:
+        try:
+            token = normalize_cursor_token(json.loads(path.read_text(errors='replace')).get('accessToken'))
+            if token:
+                tokens.append(token)
+        except Exception:
+            continue
+    return tokens
+
+
+def cursor_cookie(raw_token):
+    """Build Cursor's dashboard cookie from a local session JWT."""
+    value = raw_token.strip()
+    if value.startswith('WorkosCursorSessionToken='):
+        value = value[len('WorkosCursorSessionToken='):]
+    value = value.replace('%3A%3A', '::')
+    supplied_user, separator, token = value.partition('::')
+    if not separator:
+        token = supplied_user
+        supplied_user = ''
+    parts = token.split('.')
+    if len(parts) < 2:
+        return None
+    payload = base64url_decode(parts[1])
+    try:
+        claims = json.loads(payload.decode('utf-8', errors='replace'))
+    except Exception:
+        return None
+    if claims.get('type') == 'api_key_token':
+        return None
+    expires = flexible_number(claims.get('exp'))
+    if expires and expires <= datetime.now(timezone.utc).timestamp():
+        return None
+    subject = supplied_user or str(claims.get('sub') or '').split('|')[-1]
+    return f'{subject}%3A%3A{token}' if subject else None
+
+
+def cursor_request(url, cookie, method='GET', data=None):
+    """Call a read-only Cursor dashboard endpoint."""
+    return fetch_json_request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            'Cookie': f'WorkosCursorSessionToken={cookie}',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Origin': 'https://cursor.com',
+            'User-Agent': 'AIUsageMonitor',
+        },
+    )
+
+
+def cursor_percentage(plan, explicit_key):
+    """Read explicit Cursor percentages or derive them from used/limit."""
+    explicit = flexible_number((plan or {}).get(explicit_key))
+    if explicit is not None:
+        return clamp_percentage(explicit)
+    used = flexible_number((plan or {}).get('totalSpend') or (plan or {}).get('used'))
+    limit = flexible_number((plan or {}).get('limit'))
+    return clamp_percentage(used / limit * 100) if used is not None and limit else None
+
+
+def parse_cursor_usage(payload):
+    """Convert Cursor dashboard payloads to common usage windows."""
+    plan = payload.get('planUsage') or (payload.get('individualUsage') or {}).get('plan') or {}
+    reset_time = reset_from_value(payload.get('billingCycleEnd'))
+    start = reset_from_value(payload.get('billingCycleStart'))
+    window_seconds = None
+    if start and reset_time:
+        window_seconds = int((parse_iso8601(reset_time) - parse_iso8601(start)).total_seconds())
+    api_pct = cursor_percentage(plan, 'apiPercentUsed')
+    auto_pct = cursor_percentage(plan, 'autoPercentUsed')
+    unlimited_value = payload.get('isUnlimited')
+    if isinstance(unlimited_value, str):
+        unlimited = unlimited_value.strip().lower() in ('true', '1')
+    else:
+        unlimited = bool(unlimited_value)
+    if not unlimited and api_pct is None and auto_pct is None:
+        raise RuntimeError('Cursor returned no individual quota data')
+    primary = make_window(api_pct, reset_time, window_seconds, 'API') if api_pct is not None else None
+    secondary = make_window(auto_pct, reset_time, window_seconds, 'Auto/Composer') if auto_pct is not None else None
+    membership = str(payload.get('membershipType') or '').strip()
+    label = ' · '.join(filter(None, (membership, 'Unlimited' if unlimited else '')))
+    return windows_result(primary, secondary, account_label=label, credential_source='cursor_session')
+
+
+def fetch_cursor_provider():
+    """Fetch Cursor Individual usage from the signed-in local session."""
+    tokens = cursor_tokens()
+    databases, auth_files = cursor_candidate_paths()
+    installed = any(path.exists() for path in databases + auth_files) or bool(tokens)
+    last_auth_error = None
+    for token in tokens:
+        cookie = cursor_cookie(token)
+        if not cookie:
+            continue
+        try:
+            payload = cursor_request(
+                'https://cursor.com/api/dashboard/get-current-period-usage',
+                cookie,
+                method='POST',
+                data=b'{}',
+            )
+            if not any(key in payload for key in ('planUsage', 'billingCycleEnd', 'isUnlimited')):
+                raise RuntimeError('Cursor current-period payload unavailable')
+        except urllib.error.HTTPError as error:
+            if error.code in (401, 403):
+                last_auth_error = error
+                continue
+            if error.code == 429:
+                raise
+            payload = cursor_request('https://cursor.com/api/usage-summary', cookie)
+        except RuntimeError:
+            payload = cursor_request('https://cursor.com/api/usage-summary', cookie)
+        return parse_cursor_usage(payload)
+    if last_auth_error:
+        raise last_auth_error
+    return {
+        'installed': installed,
+        'authenticated': False,
+        'has_usage': False,
+        'fail_reason': 'auth_required',
+        'error': 'Sign into Cursor to read Individual usage',
+    }
+
+
+ADDITIONAL_PROVIDERS = {
+    'zai': fetch_zai_provider,
+    'kimi': fetch_kimi_provider,
+    'minimax': fetch_minimax_provider,
+    'qwen': fetch_qwen_provider,
+    'cursor': fetch_cursor_provider,
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Claude Code
 # ─────────────────────────────────────────────────────────────────────────────
 
-if not _only or _only == 'claude':
-    claude_creds_path = Path.home() / '.claude' / '.credentials.json'
+def claude_credentials():
+    """Load Claude OAuth tokens from environment and common CLI paths."""
+    candidates = []
+    expired_found = False
+    seen = set()
+    for variable in ('CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_ACCESS_TOKEN'):
+        token = first_env(variable)
+        if token and token not in seen:
+            seen.add(token)
+            candidates.append((token, 'Setup token' if variable == 'CLAUDE_CODE_OAUTH_TOKEN' else 'Environment'))
 
-    if claude_creds_path.exists():
+    paths = [
+        Path.home() / '.claude' / '.credentials.json',
+        Path.home() / '.claude' / 'credentials.json',
+        Path.home() / '.config' / 'claude' / 'credentials.json',
+    ]
+    for path in paths:
         try:
-            creds = json.loads(claude_creds_path.read_text(errors='replace'))
-            token = creds['claudeAiOauth']['accessToken']
+            credentials = json.loads(path.read_text(errors='replace'))
+        except Exception:
+            continue
+        oauth = credentials.get('claudeAiOauth') or {}
+        token = str(oauth.get('accessToken') or credentials.get('accessToken') or '').strip()
+        expires = flexible_number(oauth.get('expiresAt'))
+        if expires and expires / 1000 <= datetime.now(timezone.utc).timestamp():
+            expired_found = True
+            continue
+        if token and token not in seen:
+            seen.add(token)
+            candidates.append((token, oauth.get('rateLimitTier') or 'Claude CLI'))
+    return candidates, expired_found
 
-            req = urllib.request.Request(
-                'https://api.anthropic.com/api/oauth/usage',
-                headers={
-                    'Authorization': f'Bearer {token}',
-                    'anthropic-beta': 'oauth-2025-04-20',
-                    'User-Agent': (
-                        'Mozilla/5.0 (X11; Linux x86_64) '
-                        'AppleWebKit/537.36 (KHTML, like Gecko) '
-                        'Chrome/120.0.0.0 Safari/537.36'
-                    ),
-                },
-            )
 
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
-
-            five_hour = data.get('five_hour') or {}
-            seven_day = data.get('seven_day') or {}
-
-            result['claude'] = {
-                'installed': True,
-                'authenticated': True,
-                'five_hour_pct': round(five_hour.get('utilization') or 0),
-                'five_hour_reset': five_hour.get('resets_at'),
-                'seven_day_pct': round(seven_day.get('utilization') or 0) if seven_day else None,
-                'seven_day_reset': seven_day.get('resets_at') if seven_day else None,
-            }
-
-        except urllib.error.HTTPError as e:
-            result['claude'] = {
+def fetch_claude_provider():
+    """Try Claude credential sources in priority order."""
+    candidates, expired_found = claude_credentials()
+    if not candidates:
+        if expired_found:
+            return {
                 'installed': True,
                 'authenticated': False,
-                **classify_http_failure('claude', e.code, read_http_error_body(e)),
+                'fail_reason': 'token_expired',
+                'error': 'Claude token expired; run claude auth login',
             }
+        return {'installed': False, 'authenticated': False}
+    last_error = None
+    for token, source in candidates:
+        request = urllib.request.Request(
+            'https://api.anthropic.com/api/oauth/usage',
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Accept': 'application/json',
+                'anthropic-beta': 'oauth-2025-04-20',
+                'User-Agent': 'claude-cli/2.1.80',
+            },
+        )
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    data = json.loads(response.read())
+                five_hour = data.get('five_hour') or {}
+                seven_day = data.get('seven_day') or {}
+                return {
+                    'installed': True,
+                    'authenticated': True,
+                    'five_hour_pct': round(five_hour.get('utilization') or 0),
+                    'five_hour_reset': five_hour.get('resets_at'),
+                    'seven_day_pct': round(seven_day.get('utilization') or 0) if seven_day else None,
+                    'seven_day_reset': seven_day.get('resets_at') if seven_day else None,
+                    'credential_source': source,
+                }
+            except urllib.error.HTTPError as error:
+                if error.code in (401, 403):
+                    last_error = error
+                    break
+                retry = parse_retry_after(error.headers.get('Retry-After'))
+                if error.code == 429 and attempt == 0 and retry and retry.get('retry_after_seconds', 0) <= 30:
+                    time.sleep(retry['retry_after_seconds'])
+                    continue
+                raise
+    if last_error:
+        raise last_error
+    return {'installed': True, 'authenticated': False}
 
-        except Exception as e:
-            result['claude'] = {
-                'installed': True,
-                'authenticated': False,
-                **classify_exception_failure(e),
-            }
-
-    else:
+if not _only or _only == 'claude':
+    try:
+        result['claude'] = fetch_claude_provider()
+    except urllib.error.HTTPError as e:
         result['claude'] = {
-            'installed': False,
+            'installed': True,
             'authenticated': False,
+            **classify_http_failure('claude', e.code, read_http_error_body(e)),
+        }
+    except Exception as e:
+        result['claude'] = {
+            'installed': True,
+            'authenticated': False,
+            **classify_exception_failure(e),
         }
 
 
@@ -2763,6 +3338,33 @@ if not _only or _only == 'gemini':
 
     except Exception as e:
         result['gemini'] = {
+            'installed': True,
+            'authenticated': False,
+            **classify_exception_failure(e),
+        }
+
+
+for provider_name, fetch_provider in ADDITIONAL_PROVIDERS.items():
+    if _only and _only != provider_name:
+        continue
+    try:
+        result[provider_name] = fetch_provider()
+    except urllib.error.HTTPError as e:
+        error = classify_http_failure(
+            provider_name,
+            e.code,
+            read_http_error_body(e),
+        )
+        retry_info = getattr(e, 'retry_after_info', None)
+        if retry_info:
+            error.update(retry_info)
+        result[provider_name] = {
+            'installed': True,
+            'authenticated': False,
+            **error,
+        }
+    except Exception as e:
+        result[provider_name] = {
             'installed': True,
             'authenticated': False,
             **classify_exception_failure(e),

@@ -10,8 +10,15 @@ const CODEX_REFRESH_VALUES = [10, 30, 60, 300];
 
 const GEMINI_REFRESH_LABELS = ['1 minute', '5 minutes', '10 minutes', '30 minutes'];
 const GEMINI_REFRESH_VALUES = [60, 300, 600, 1800];
-const PANEL_TOOL_LABELS = ['Claude Code', 'OpenAI Codex', 'Gemini CLI'];
-const PANEL_TOOL_VALUES = ['claude', 'codex', 'gemini'];
+const ADDITIONAL_REFRESH_LABELS = ['1 minute', '5 minutes', '10 minutes', '30 minutes'];
+const ADDITIONAL_REFRESH_VALUES = [60, 300, 600, 1800];
+const PANEL_TOOL_LABELS = [
+    'Claude Code', 'OpenAI Codex', 'Gemini CLI', 'Z.AI', 'Kimi Code',
+    'MiniMax', 'QwenCloud', 'Cursor',
+];
+const PANEL_TOOL_VALUES = [
+    'claude', 'codex', 'gemini', 'zai', 'kimi', 'minimax', 'qwen', 'cursor',
+];
 const DISPLAY_MODE_LABELS = ['Ring and percentage', 'Ring only', 'Percentage only'];
 
 function createDropdownRow(title, labels, selectedIndex, onChange) {
@@ -62,6 +69,12 @@ export default class AIUsageMonitorPreferences extends ExtensionPreferences {
             GEMINI_REFRESH_LABELS,
             Math.max(0, GEMINI_REFRESH_VALUES.indexOf(settings.get_int('gemini-refresh-interval'))),
             selected => settings.set_int('gemini-refresh-interval', GEMINI_REFRESH_VALUES[selected])
+        ));
+        refreshGroup.add(createDropdownRow(
+            'Other providers',
+            ADDITIONAL_REFRESH_LABELS,
+            Math.max(0, ADDITIONAL_REFRESH_VALUES.indexOf(settings.get_int('additional-refresh-interval'))),
+            selected => settings.set_int('additional-refresh-interval', ADDITIONAL_REFRESH_VALUES[selected])
         ));
 
         const panelGroup = new Adw.PreferencesGroup({
@@ -120,6 +133,24 @@ export default class AIUsageMonitorPreferences extends ExtensionPreferences {
             settings.set_boolean('show-gemini', widget.get_active());
         });
         visibilityGroup.add(geminiSwitch);
+
+        for (const [key, title] of [
+            ['zai', 'Z.AI'],
+            ['kimi', 'Kimi Code'],
+            ['minimax', 'MiniMax'],
+            ['qwen', 'QwenCloud'],
+            ['cursor', 'Cursor'],
+        ]) {
+            const row = new Adw.SwitchRow({
+                title,
+                subtitle: `Show ${title} usage in popup`,
+                active: settings.get_boolean(`show-${key}`),
+            });
+            row.connect('notify::active', widget => {
+                settings.set_boolean(`show-${key}`, widget.get_active());
+            });
+            visibilityGroup.add(row);
+        }
 
         page.add(refreshGroup);
         page.add(panelGroup);

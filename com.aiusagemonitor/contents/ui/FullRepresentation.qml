@@ -10,7 +10,7 @@ import org.kde.kirigami as Kirigami
 Item {
     id: fullRoot
     implicitWidth: 390
-    implicitHeight: contentCol.implicitHeight + 24
+    implicitHeight: Math.min(contentCol.implicitHeight + 24, Kirigami.Units.gridUnit * 36)
 
     property var cd: root.claudeData
     property var od: root.codexData
@@ -127,10 +127,30 @@ Item {
         return name + ": " + value
     }
 
-    ColumnLayout {
-        id: contentCol
-        anchors { left: parent.left; right: parent.right; top: parent.top; margins: 12 }
-        spacing: 0
+    function providerDisplayName(provider) {
+        if (provider === "zai") return "Z.AI"
+        if (provider === "kimi") return "KIMI CODE"
+        if (provider === "minimax") return "MINIMAX"
+        if (provider === "qwen") return "QWENCLOUD"
+        if (provider === "cursor") return "CURSOR"
+        return provider.toUpperCase()
+    }
+
+    Flickable {
+        id: viewport
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: contentCol.implicitHeight + 24
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        QQC2.ScrollBar.vertical: QQC2.ScrollBar {}
+
+        ColumnLayout {
+            id: contentCol
+            x: 12
+            y: 12
+            width: Math.max(0, viewport.width - 24)
+            spacing: 0
 
         RowLayout {
             Layout.fillWidth: true
@@ -217,6 +237,96 @@ Item {
                 }
 
                 Kirigami.Separator { Layout.fillWidth: true; Layout.topMargin: 4; Layout.bottomMargin: 4 }
+            }
+        }
+
+        Repeater {
+            model: {
+                var rows = []
+                for (var provider of root.additionalProviders) {
+                    var data = root.additionalData[provider] || {}
+                    if (root.showAdditionalProvider(provider) && data.installed === true)
+                        rows.push({provider: provider, data: data})
+                }
+                return rows
+            }
+
+            delegate: ColumnLayout {
+                id: providerCard
+
+                required property var modelData
+                readonly property string provider: modelData.provider
+                readonly property var providerData: modelData.data
+
+                Layout.fillWidth: true
+                spacing: 6
+
+                RowLayout {
+                    Layout.fillWidth: true
+
+                    PC3.Label {
+                        text: fullRoot.providerDisplayName(providerCard.provider)
+                        font.bold: true
+                        font.pixelSize: 12
+                    }
+                    Item { Layout.fillWidth: true }
+                    PC3.Label {
+                        visible: !!providerCard.providerData.account_label
+                        text: providerCard.providerData.account_label || ""
+                        font.pixelSize: 10
+                        color: Kirigami.Theme.disabledTextColor
+                        elide: Text.ElideRight
+                        Layout.maximumWidth: 220
+                    }
+                }
+
+                PC3.Label {
+                    visible: !!providerCard.providerData.error
+                    text: providerCard.providerData.error || ""
+                    font.pixelSize: 10
+                    color: Kirigami.Theme.negativeTextColor
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                }
+
+                Loader {
+                    Layout.fillWidth: true
+                    active: providerCard.providerData.five_hour_pct !== undefined && !providerCard.providerData.error
+                    sourceComponent: UsageBar {
+                        label: providerCard.providerData.primary_label || "Usage"
+                        pct: Math.min(providerCard.providerData.five_hour_pct || 0, 100)
+                        pctText: Math.round(providerCard.providerData.five_hour_pct || 0) + "%"
+                        resetText: fullRoot.formatReset(providerCard.providerData.five_hour_reset)
+                        barColor: fullRoot.usageColor(providerCard.providerData.five_hour_pct || 0)
+                    }
+                }
+
+                Loader {
+                    Layout.fillWidth: true
+                    active: providerCard.providerData.seven_day_pct !== undefined && !providerCard.providerData.error
+                    sourceComponent: UsageBar {
+                        label: providerCard.providerData.secondary_label || "Secondary"
+                        pct: Math.min(providerCard.providerData.seven_day_pct || 0, 100)
+                        pctText: Math.round(providerCard.providerData.seven_day_pct || 0) + "%"
+                        resetText: fullRoot.formatReset(providerCard.providerData.seven_day_reset)
+                        barColor: fullRoot.usageColor(providerCard.providerData.seven_day_pct || 0)
+                    }
+                }
+
+                InfoBox {
+                    visible: !providerCard.providerData.error
+                        && providerCard.providerData.authenticated === true
+                        && providerCard.providerData.has_usage === false
+                    title: fullRoot.providerDisplayName(providerCard.provider) + " authenticated"
+                    text: providerCard.providerData.usage_note || "This provider does not expose quota percentages."
+                    tone: "info"
+                }
+
+                Kirigami.Separator {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 4
+                    Layout.bottomMargin: 4
+                }
             }
         }
 
@@ -519,12 +629,22 @@ Item {
             readonly property bool claudeVisible: cd.installed === true && root.showClaude === true
             readonly property bool codexVisible: od.installed === true && root.showCodex === true
             readonly property bool geminiVisible: gd.installed === true && root.showGemini === true
-            active: !claudeVisible && !codexVisible && !geminiVisible
+            readonly property bool additionalVisible: {
+                for (var provider of root.additionalProviders) {
+                    if (root.showAdditionalProvider(provider)
+                        && (root.additionalData[provider] || {}).installed === true)
+                        return true
+                }
+                return false
+            }
+            active: !claudeVisible && !codexVisible && !geminiVisible && !additionalVisible
 
             sourceComponent: PC3.Label {
                 text: {
                     if (root.isLoading) return "Loading…"
                     var allHidden = (cd.installed === true || od.installed === true || gd.installed === true)
+                    for (var provider of root.additionalProviders)
+                        allHidden = allHidden || (root.additionalData[provider] || {}).installed === true
                     return allHidden ? "All tools hidden in settings" : "No AI tools detected"
                 }
                 color: Kirigami.Theme.disabledTextColor
@@ -533,7 +653,8 @@ Item {
             }
         }
 
-        Item { Layout.preferredHeight: 4 }
+            Item { Layout.preferredHeight: 4 }
+        }
     }
 
     component InfoBox: Rectangle {

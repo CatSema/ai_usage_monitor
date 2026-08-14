@@ -9,6 +9,7 @@ QQC2.ScrollView {
     property int cfg_claudeRefreshSecs: 600
     property int cfg_codexRefreshSecs: 60
     property int cfg_geminiRefreshSecs: 300
+    property int cfg_additionalRefreshSecs: 300
     property string cfg_panelTool: "claude"
     property int cfg_panelDisplayMode: 0
 
@@ -16,6 +17,11 @@ QQC2.ScrollView {
     property bool cfg_showClaude: true
     property bool cfg_showCodex: true
     property bool cfg_showGemini: true
+    property bool cfg_showZai: true
+    property bool cfg_showKimi: true
+    property bool cfg_showMinimax: true
+    property bool cfg_showQwen: true
+    property bool cfg_showCursor: true
 
     clip: true
     contentWidth: availableWidth
@@ -69,6 +75,19 @@ QQC2.ScrollView {
             onActivated: configPage.cfg_geminiRefreshSecs = model[currentIndex].value
         }
 
+        QQC2.ComboBox {
+            Kirigami.FormData.label: "Other providers:"
+            model: [
+                { text: "1 minute",   value: 60   },
+                { text: "5 minutes",  value: 300  },
+                { text: "10 minutes", value: 600  },
+                { text: "30 minutes", value: 1800 },
+            ]
+            textRole: "text"
+            currentIndex: { var v = configPage.cfg_additionalRefreshSecs; for (var i = 0; i < model.length; i++) { if (model[i].value === v) return i } return 1 }
+            onActivated: configPage.cfg_additionalRefreshSecs = model[currentIndex].value
+        }
+
         QQC2.Label {
             Kirigami.FormData.label: "Gemini auth:"
             text: "OAuth shows quota usage. API key and Vertex AI can show project usage with Cloud Monitoring and configured limits; Vertex AI can also show quota metrics."
@@ -104,6 +123,31 @@ QQC2.ScrollView {
                 text: "Gemini CLI"
                 checked: configPage.cfg_panelTool === "gemini"
                 onToggled: if (checked) configPage.cfg_panelTool = "gemini"
+            }
+            QQC2.RadioButton {
+                text: "Z.AI"
+                checked: configPage.cfg_panelTool === "zai"
+                onToggled: if (checked) configPage.cfg_panelTool = "zai"
+            }
+            QQC2.RadioButton {
+                text: "Kimi Code"
+                checked: configPage.cfg_panelTool === "kimi"
+                onToggled: if (checked) configPage.cfg_panelTool = "kimi"
+            }
+            QQC2.RadioButton {
+                text: "MiniMax"
+                checked: configPage.cfg_panelTool === "minimax"
+                onToggled: if (checked) configPage.cfg_panelTool = "minimax"
+            }
+            QQC2.RadioButton {
+                text: "QwenCloud"
+                checked: configPage.cfg_panelTool === "qwen"
+                onToggled: if (checked) configPage.cfg_panelTool = "qwen"
+            }
+            QQC2.RadioButton {
+                text: "Cursor"
+                checked: configPage.cfg_panelTool === "cursor"
+                onToggled: if (checked) configPage.cfg_panelTool = "cursor"
             }
         }
 
@@ -158,6 +202,31 @@ QQC2.ScrollView {
                 text: "Gemini CLI"
                 checked: configPage.cfg_showGemini
                 onToggled: configPage.cfg_showGemini = checked
+            }
+            QQC2.CheckBox {
+                text: "Z.AI"
+                checked: configPage.cfg_showZai
+                onToggled: configPage.cfg_showZai = checked
+            }
+            QQC2.CheckBox {
+                text: "Kimi Code"
+                checked: configPage.cfg_showKimi
+                onToggled: configPage.cfg_showKimi = checked
+            }
+            QQC2.CheckBox {
+                text: "MiniMax"
+                checked: configPage.cfg_showMinimax
+                onToggled: configPage.cfg_showMinimax = checked
+            }
+            QQC2.CheckBox {
+                text: "QwenCloud"
+                checked: configPage.cfg_showQwen
+                onToggled: configPage.cfg_showQwen = checked
+            }
+            QQC2.CheckBox {
+                text: "Cursor"
+                checked: configPage.cfg_showCursor
+                onToggled: configPage.cfg_showCursor = checked
             }
         }
     }

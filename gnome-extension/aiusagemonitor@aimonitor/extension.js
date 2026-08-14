@@ -13,6 +13,19 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 const PANEL_RING_SIZE = 16;
 const PANEL_RING_STROKE = 2.2;
 const POPUP_BAR_WIDTH = 150;
+const CORE_PROVIDERS = ['claude', 'codex', 'gemini'];
+const ADDITIONAL_PROVIDERS = ['zai', 'kimi', 'minimax', 'qwen', 'cursor'];
+const ALL_PROVIDERS = [...CORE_PROVIDERS, ...ADDITIONAL_PROVIDERS];
+const PROVIDER_NAMES = {
+    claude: 'Claude Code',
+    codex: 'OpenAI Codex',
+    gemini: 'Gemini CLI',
+    zai: 'Z.AI',
+    kimi: 'Kimi Code',
+    minimax: 'MiniMax',
+    qwen: 'QwenCloud',
+    cursor: 'Cursor',
+};
 
 function menuItemActor(item) {
     return item.actor ?? item;
@@ -35,9 +48,12 @@ class AIUsageIndicator extends PanelMenu.Button {
         this._claudeData = {};
         this._codexData = {};
         this._geminiData = {};
+        this._additionalData = {};
         this._isLoading = true;
+        this._pendingRefreshes = 0;
         this._panelPct = 0;
         this._panelColor = '#22c55e';
+        this._panelNoUsage = false;
 
         // Pre-load tool icons for the panel bar
         this._toolGIcons = {};
@@ -79,12 +95,11 @@ class AIUsageIndicator extends PanelMenu.Button {
 
         this._settingsChangedId = this._settings.connect('changed', this._onSettingsChanged.bind(this));
 
-        this._refreshProvider('claude');
-        this._refreshProvider('codex');
-        this._refreshProvider('gemini');
-        this._scheduleRefresh('claude');
-        this._scheduleRefresh('codex');
-        this._scheduleRefresh('gemini');
+        for (const provider of ALL_PROVIDERS)
+            this._refreshProvider(provider);
+        for (const provider of CORE_PROVIDERS)
+            this._scheduleRefresh(provider);
+        this._scheduleAdditionalRefresh();
     }
 
     _buildMenu() {
@@ -126,10 +141,12 @@ class AIUsageIndicator extends PanelMenu.Button {
         const {tool, data} = this._resolvePanelTool(selectedTool);
         let pct = this._clampPct(this._getToolPct(tool, data));
 
-        if (this._isLoading)
+        if (this._isLoading && !data.installed)
             this._panelLabel.text = '...';
         else if (data.error)
             this._panelLabel.text = '!';
+        else if (data.has_usage === false)
+            this._panelLabel.text = this._getToolShortName(tool);
         else
             this._panelLabel.text = `${Math.round(pct)}%`;
 
@@ -141,9 +158,10 @@ class AIUsageIndicator extends PanelMenu.Button {
             this._panelToolIcon.visible = false;
         }
 
-        let color = this._getUsageColor(pct);
+        let color = data.has_usage === false ? '#3b82f6' : this._getUsageColor(pct);
         this._panelPct = pct;
         this._panelColor = color;
+        this._panelNoUsage = data.has_usage === false && data.authenticated === true;
         this._panelRing.queue_repaint();
         this._panelLabel.style = `font-size: 11px; font-weight: bold; color: ${color};`;
 
@@ -171,11 +189,14 @@ class AIUsageIndicator extends PanelMenu.Button {
         if (tool === 'claude') return this._claudeData || {};
         if (tool === 'codex') return this._codexData || {};
         if (tool === 'gemini') return this._geminiData || {};
+        if (ADDITIONAL_PROVIDERS.includes(tool)) return this._additionalData[tool] || {};
         return {};
     }
 
     _toolUsable(tool, data) {
         if (!data?.installed || data.error)
+            return false;
+        if (data.has_usage === false)
             return false;
         if (tool === 'codex' && data.has_data === false)
             return false;
@@ -183,8 +204,12 @@ class AIUsageIndicator extends PanelMenu.Button {
     }
 
     _resolvePanelTool(selectedTool) {
-        let preferred = ['claude', 'codex', 'gemini'].includes(selectedTool) ? selectedTool : 'claude';
-        for (let tool of [preferred, 'claude', 'codex', 'gemini']) {
+        let preferred = ALL_PROVIDERS.includes(selectedTool) ? selectedTool : 'claude';
+        const preferredData = this._toolData(preferred);
+        if (preferredData.installed && !preferredData.error &&
+            !(preferred === 'codex' && preferredData.has_data === false))
+            return {tool: preferred, data: preferredData};
+        for (let tool of [preferred, ...ALL_PROVIDERS]) {
             let data = this._toolData(tool);
             if (this._toolUsable(tool, data))
                 return {tool, data};
@@ -205,9 +230,12 @@ class AIUsageIndicator extends PanelMenu.Button {
     }
 
     _getToolName(tool) {
-        if (tool === 'codex') return 'OpenAI Codex';
-        if (tool === 'gemini') return 'Gemini CLI';
-        return 'Claude Code';
+        return PROVIDER_NAMES[tool] || tool;
+    }
+
+    _getToolShortName(tool) {
+        const names = {zai: 'Z.AI', kimi: 'Kimi', minimax: 'MM', qwen: 'Qwen', cursor: 'Cursor'};
+        return names[tool] || 'N/A';
     }
 
     _getDisplayMode() {
@@ -234,10 +262,11 @@ class AIUsageIndicator extends PanelMenu.Button {
             cr.arc(cx, cy, radius, 0, Math.PI * 2);
             cr.stroke();
 
-            if (this._panelPct > 0) {
+            if (this._panelPct > 0 || this._panelNoUsage) {
                 let [r, g, b] = this._hexToRgb(this._panelColor);
                 cr.setSourceRGBA(r, g, b, 1);
-                cr.arc(cx, cy, radius, start, end);
+                cr.arc(cx, cy, radius, start,
+                    this._panelNoUsage ? start + Math.PI * 2 : end);
                 cr.stroke();
             }
         } finally {
@@ -251,6 +280,16 @@ class AIUsageIndicator extends PanelMenu.Button {
         const showClaude = this._settings.get_boolean('show-claude');
         const showCodex = this._settings.get_boolean('show-codex');
         const showGemini = this._settings.get_boolean('show-gemini');
+        const visibility = {
+            claude: showClaude,
+            codex: showCodex,
+            gemini: showGemini,
+            zai: this._settings.get_boolean('show-zai'),
+            kimi: this._settings.get_boolean('show-kimi'),
+            minimax: this._settings.get_boolean('show-minimax'),
+            qwen: this._settings.get_boolean('show-qwen'),
+            cursor: this._settings.get_boolean('show-cursor'),
+        };
 
         let anyVisible = false;
 
@@ -269,9 +308,18 @@ class AIUsageIndicator extends PanelMenu.Button {
             anyVisible = true;
         }
 
+        for (const provider of ADDITIONAL_PROVIDERS) {
+            const data = this._toolData(provider);
+            if (visibility[provider] && data.installed) {
+                this._contentBox.add_child(this._createToolSection(
+                    PROVIDER_NAMES[provider], data, provider));
+                anyVisible = true;
+            }
+        }
+
         if (!anyVisible) {
             let msg = this._isLoading ? 'Loading...' :
-                (this._claudeData.installed || this._codexData.installed || this._geminiData.installed)
+                ALL_PROVIDERS.some(provider => this._toolData(provider).installed)
                     ? 'All tools hidden in settings' : 'No AI tools detected';
             this._contentBox.add_child(new St.Label({
                 text: msg,
@@ -303,6 +351,12 @@ class AIUsageIndicator extends PanelMenu.Button {
             text: name.toUpperCase(),
             style: 'font-weight: bold; font-size: 11px;',
         }));
+        if (data.account_label) {
+            headerBox.add_child(new St.Label({
+                text: ` · ${data.account_label}`,
+                style: 'font-size: 10px; color: gray;',
+            }));
+        }
         section.add_child(headerBox);
 
         if (data.error) {
@@ -327,9 +381,20 @@ class AIUsageIndicator extends PanelMenu.Button {
             }
         } else {
             if (data.five_hour_pct !== undefined && !data.error)
-                section.add_child(this._createUsageBar('5h', data.five_hour_pct, data.five_hour_reset));
+                section.add_child(this._createUsageBar(
+                    data.primary_label || '5h', data.five_hour_pct, data.five_hour_reset));
             if (data.seven_day_pct !== undefined && data.seven_day_pct !== null && !data.error)
-                section.add_child(this._createUsageBar('7d', data.seven_day_pct, data.seven_day_reset));
+                section.add_child(this._createUsageBar(
+                    data.secondary_label || '7d', data.seven_day_pct, data.seven_day_reset));
+            if (!data.error && data.authenticated === true && data.has_usage === false) {
+                const note = new St.Label({
+                    text: data.usage_note || 'Quota percentage is not exposed by this provider.',
+                    style: 'color: #64748b; font-size: 10px; margin-bottom: 4px;',
+                });
+                note.clutter_text.line_wrap = true;
+                note.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
+                section.add_child(note);
+            }
         }
 
         section.add_child(menuItemActor(new PopupMenu.PopupSeparatorMenuItem()));
@@ -442,7 +507,8 @@ class AIUsageIndicator extends PanelMenu.Button {
             this[cancellableKey].cancel();
         this[cancellableKey] = new Gio.Cancellable();
 
-        this._isLoading = !this._claudeData.installed && !this._codexData.installed && !this._geminiData.installed;
+        this._pendingRefreshes++;
+        this._isLoading = this._pendingRefreshes > 0;
         this._updatePanelIcon();
 
         let proc;
@@ -453,7 +519,8 @@ class AIUsageIndicator extends PanelMenu.Button {
             });
             proc.init(this[cancellableKey]);
         } catch (e) {
-            this._isLoading = false;
+            this._pendingRefreshes = Math.max(0, this._pendingRefreshes - 1);
+            this._isLoading = this._pendingRefreshes > 0;
             this._updatePanelIcon();
             this._updateContent();
             return;
@@ -467,22 +534,29 @@ class AIUsageIndicator extends PanelMenu.Button {
                     if (parsed.claude !== undefined) this._claudeData = parsed.claude || {};
                     if (parsed.codex  !== undefined) this._codexData  = parsed.codex  || {};
                     if (parsed.gemini !== undefined) this._geminiData = parsed.gemini || {};
+                    for (const provider of ADDITIONAL_PROVIDERS) {
+                        if (parsed[provider] !== undefined)
+                            this._additionalData[provider] = parsed[provider] || {};
+                    }
                 }
             } catch (e) {
-                if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) {
+                    this._pendingRefreshes = Math.max(0, this._pendingRefreshes - 1);
+                    this._isLoading = this._pendingRefreshes > 0;
                     return;
+                }
             }
 
-            this._isLoading = false;
+            this._pendingRefreshes = Math.max(0, this._pendingRefreshes - 1);
+            this._isLoading = this._pendingRefreshes > 0;
             this._updatePanelIcon();
             this._updateContent();
         });
     }
 
     _refresh() {
-        this._refreshProvider('claude');
-        this._refreshProvider('codex');
-        this._refreshProvider('gemini');
+        for (const provider of ALL_PROVIDERS)
+            this._refreshProvider(provider);
     }
 
     _scheduleRefresh(provider) {
@@ -497,16 +571,28 @@ class AIUsageIndicator extends PanelMenu.Button {
         });
     }
 
+    _scheduleAdditionalRefresh() {
+        if (this._additionalTimeoutId)
+            GLib.source_remove(this._additionalTimeoutId);
+        const interval = this._settings.get_int('additional-refresh-interval');
+        this._additionalTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, interval, () => {
+            for (const provider of ADDITIONAL_PROVIDERS)
+                this._refreshProvider(provider);
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
     _onSettingsChanged(_settings, key) {
         if (key === 'claude-refresh-interval') this._scheduleRefresh('claude');
         else if (key === 'codex-refresh-interval') this._scheduleRefresh('codex');
         else if (key === 'gemini-refresh-interval') this._scheduleRefresh('gemini');
+        else if (key === 'additional-refresh-interval') this._scheduleAdditionalRefresh();
         this._updatePanelIcon();
         this._updateContent();
     }
 
     destroy() {
-        for (const provider of ['claude', 'codex', 'gemini']) {
+        for (const provider of ALL_PROVIDERS) {
             const cancellableKey = `_${provider}Cancellable`;
             const timeoutKey = `_${provider}TimeoutId`;
             if (this[cancellableKey]) {
@@ -517,6 +603,11 @@ class AIUsageIndicator extends PanelMenu.Button {
                 GLib.source_remove(this[timeoutKey]);
                 this[timeoutKey] = null;
             }
+        }
+
+        if (this._additionalTimeoutId) {
+            GLib.source_remove(this._additionalTimeoutId);
+            this._additionalTimeoutId = null;
         }
 
         if (this._settingsChangedId) {

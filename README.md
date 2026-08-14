@@ -7,6 +7,11 @@ Cross-platform desktop widget/extension to monitor usage for:
 - **Claude Code** - Track your 5-hour and 7-day usage limits
 - **OpenAI Codex** - Monitor your Codex API quotas
 - **Gemini CLI** - Keep track of Gemini model usage across all available models
+- **Z.AI** - Monitor token and request quotas
+- **Kimi Code** - Track short and weekly Coding Plan windows
+- **MiniMax** - Track five-hour Coding Plan prompt limits
+- **QwenCloud** - Validate Individual Token Plan credentials without inference
+- **Cursor** - Read Individual usage from the existing local Cursor session
 
 Shows a compact panel indicator and a full popup with limits, usage percentages, and reset times.
 
@@ -41,13 +46,26 @@ cd gnome-extension/aiusagemonitor@aimonitor
 
 ## Features
 
-- **Multi-tool monitoring** - Track Claude, Codex, and Gemini in one place
+- **Multi-provider monitoring** - Track eight AI coding providers in one place
 - **Automatic token refresh** - Gemini tokens refresh automatically when expired (NEW!)
 - **Smart retry logic** - Up to 3 retry attempts with detailed error reporting
 - **Color-coded usage** - Visual indicators: 🟢 Green → 🟡 Yellow → 🟠 Orange → 🔴 Red
 - **Fully configurable** - Show/hide tools, adjust refresh rates, customize display
 - **Privacy-first** - No sensitive data exposed, all credentials stay local
 - **Detailed metrics** - See usage percentages, reset times, and model information
+- **Read-only provider checks** - Cursor and QwenCloud checks never issue model requests
+
+Additional providers discover credentials from existing application state or environment variables:
+
+Variables can be supplied by the desktop session, `~/.config/environment.d/*.conf`, or `~/.config/ai-usage-monitor/.env`.
+
+- Z.AI: `ZAI_API_KEY`, `ZAI_KEY`, `ZHIPU_API_KEY`, or `ZHIPUAI_API_KEY`
+- Kimi Code: `KIMI_API_KEY`, `KIMI_CODE_API_KEY`, or `KIMI_KEY`
+- MiniMax: `MINIMAX_KEY` or `MINIMAX_API_KEY`
+- QwenCloud: `QWEN_API_KEY`, `BAILIAN_TOKEN_PLAN_API_KEY`, or `~/.qwen/settings.json`
+- Cursor: signed-in Cursor state, Cursor Agent `auth.json`, or `CURSOR_SESSION_TOKEN`
+
+QwenCloud currently exposes key validation but no API-key-authenticated quota endpoint. Cerebras is intentionally not enabled because checking its rate-limit headers requires a paid inference request.
 
 ---
 

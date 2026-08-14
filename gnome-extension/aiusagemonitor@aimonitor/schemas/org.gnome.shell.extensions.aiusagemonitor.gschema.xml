@@ -20,10 +20,17 @@
       <description>How often to refresh Gemini usage data (in seconds)</description>
     </key>
 
+    <key name="additional-refresh-interval" type="i">
+      <range min="60" max="3600"/>
+      <default>300</default>
+      <summary>Additional providers refresh interval</summary>
+      <description>How often to refresh Z.AI, Kimi, MiniMax, QwenCloud, and Cursor</description>
+    </key>
+
     <key name="panel-tool" type="s">
       <default>'claude'</default>
       <summary>Tool to show in panel</summary>
-      <description>Which AI tool to display in the panel (claude, codex, or gemini)</description>
+      <description>Which AI provider to display in the panel</description>
     </key>
 
     <key name="panel-display-mode" type="i">
@@ -48,6 +55,36 @@
       <default>true</default>
       <summary>Show Gemini CLI</summary>
       <description>Show Gemini CLI in the popup menu</description>
+    </key>
+
+    <key name="show-zai" type="b">
+      <default>true</default>
+      <summary>Show Z.AI</summary>
+      <description>Show Z.AI in the popup menu</description>
+    </key>
+
+    <key name="show-kimi" type="b">
+      <default>true</default>
+      <summary>Show Kimi Code</summary>
+      <description>Show Kimi Code in the popup menu</description>
+    </key>
+
+    <key name="show-minimax" type="b">
+      <default>true</default>
+      <summary>Show MiniMax</summary>
+      <description>Show MiniMax in the popup menu</description>
+    </key>
+
+    <key name="show-qwen" type="b">
+      <default>true</default>
+      <summary>Show QwenCloud</summary>
+      <description>Show QwenCloud in the popup menu</description>
+    </key>
+
+    <key name="show-cursor" type="b">
+      <default>true</default>
+      <summary>Show Cursor</summary>
+      <description>Show Cursor in the popup menu</description>
     </key>
 
   </schema>
